@@ -17,11 +17,42 @@ import {
 // Paleta principal (coerente com a marca)
 const COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#ef4444", "#a855f7"];
 
+// Login fixo
+const USER = "hospitech";
+const PASS = "1234";
+
 export default function App() {
+  // --- LOGIN (persistente) ---
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    return localStorage.getItem("auth") === "1";
+  });
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+
+  const handleLogin = (e) => {
+    e.preventDefault();
+    if (username === USER && password === PASS) {
+      localStorage.setItem("auth", "1");
+      setIsAuthenticated(true);
+      setLoginError("");
+    } else {
+      setLoginError("Usuário ou senha incorretos");
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("auth");
+    setIsAuthenticated(false);
+    setUsername("");
+    setPassword("");
+  };
+
+  // --- ESTADOS DO APP ---
   const [files, setFiles] = useState([]);
   const [series, setSeries] = useState([]); // dados das planilhas
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [uploadError, setUploadError] = useState(""); // <— separado do login
   const [hiddenKeys, setHiddenKeys] = useState([]); // controla quais linhas esconder
   const [dateRange, setDateRange] = useState({ start: "", end: "" }); // filtro por período
 
@@ -33,7 +64,7 @@ export default function App() {
   const onUpload = async () => {
     if (files.length === 0) return;
     setLoading(true);
-    setError("");
+    setUploadError("");
     setSeries([]);
     try {
       const results = [];
@@ -41,20 +72,38 @@ export default function App() {
         const file = files[i];
         const form = new FormData();
         form.append("file", file);
+
+        // enviar período ao backend (opcional)
+        if (dateRange.start) form.append("start", dateRange.start);
+        if (dateRange.end) form.append("end", dateRange.end);
+
         const res = await axios.post("/api/upload", form, {
           headers: { "Content-Type": "multipart/form-data" }
         });
-        const { data: serie, stats } = res.data;
+
+        // Agora a API devolve: data (original filtrada), stats e resampled (1H)
+        const { data: serie, stats, resampled } = res.data;
+
+        // pontos originais para o gráfico
         const shaped = serie.map((d) => ({
           ...d,
           timeLabel: dayjs(d.timestamp).format("DD/MM HH:mm"),
           timestamp: d.timestamp
         }));
+
+        // série reamostrada do backend para as tabelas
+        const shapedResampled = (resampled || []).map((d) => ({
+          ...d,
+          timeLabel: dayjs(d.timestamp).format("DD/MM/YYYY HH:mm"),
+          timestamp: d.timestamp
+        }));
+
         results.push({
           id: i,
           name: file.name,
           color: COLORS[i % COLORS.length],
           data: shaped,
+          resampled: shapedResampled,
           stats
         });
       }
@@ -63,7 +112,7 @@ export default function App() {
       console.error(err);
       const msg =
         err?.response?.data?.detail || "Falha no upload/processamento";
-      setError(String(msg));
+      setUploadError(String(msg));
     } finally {
       setLoading(false);
     }
@@ -72,7 +121,7 @@ export default function App() {
   const onReset = () => {
     setFiles([]);
     setSeries([]);
-    setError("");
+    setUploadError("");
     setHiddenKeys([]);
     setDateRange({ start: "", end: "" });
   };
@@ -114,59 +163,120 @@ export default function App() {
     return arr;
   }, [series, dateRange]);
 
+  // Tabelas por planilha usando a AMOSTRAGEM DO BACKEND (1h)
+  const resampledBySeries = useMemo(() => {
+    const map = {};
+    const hasStart = !!dateRange.start;
+    const hasEnd = !!dateRange.end;
+    const start = hasStart ? dayjs(dateRange.start) : null;
+    const end = hasEnd ? dayjs(dateRange.end) : null;
+
+    series.forEach((s) => {
+      const base = s.resampled || [];
+      const rows = base.filter((r) => {
+        const t = dayjs(r.timestamp);
+        const okStart = hasStart ? (t.isAfter(start) || t.isSame(start)) : true;
+        const okEnd = hasEnd ? (t.isBefore(end) || t.isSame(end)) : true;
+        return okStart && okEnd;
+      });
+      map[s.name] = rows;
+    });
+    return map;
+  }, [series, dateRange]);
+
   // estatísticas se houver apenas 1 série ativa
   const activeSeries = series.filter((s) => !hiddenKeys.includes(s.name));
   const showStats = activeSeries.length === 1 ? activeSeries[0].stats : null;
 
-  // Exportar gráfico + estatísticas em PDF
+  // Exportar gráfico + estatísticas + TABELAS em PDF
   const exportPDF = async () => {
     const chartEl = document.getElementById("chart-section");
-    if (!chartEl) return;
+    const tablesEl = document.getElementById("tables-section");
 
-    const canvas = await html2canvas(chartEl, { scale: 2 });
-    const imgData = canvas.toDataURL("image/png");
+    if (!chartEl) return;
 
     const pdf = new jsPDF("landscape", "mm", "a4");
     const pdfWidth = pdf.internal.pageSize.getWidth();
-    const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
+    const pageHeight = pdf.internal.pageSize.getHeight();
 
-    pdf.addImage(imgData, "PNG", 0, 0, pdfWidth, pdfHeight);
+    // --- 1) Adiciona o gráfico ---
+    const chartCanvas = await html2canvas(chartEl, { scale: 2 });
+    const chartImgData = chartCanvas.toDataURL("image/png");
+    let y = 10;
+    let chartHeight = (chartCanvas.height * pdfWidth) / chartCanvas.width;
+    pdf.addImage(chartImgData, "PNG", 10, y, pdfWidth - 20, chartHeight);
 
+    y += chartHeight + 10; // espaço depois do gráfico
+
+    // Estatísticas (se houver)
     if (showStats) {
       pdf.setFontSize(12);
-      pdf.text(
-        `Temperatura mínima: ${showStats.min.toFixed(2)} °C`,
-        14,
-        pdfHeight + 20
-      );
-      pdf.text(
-        `Temperatura média: ${showStats.avg.toFixed(2)} °C`,
-        14,
-        pdfHeight + 30
-      );
-      pdf.text(
-        `Temperatura máxima: ${showStats.max.toFixed(2)} °C`,
-        14,
-        pdfHeight + 40
-      );
-      pdf.text(
-        `Início: ${dayjs(showStats.start).format("DD/MM/YYYY HH:mm")}`,
-        14,
-        pdfHeight + 50
-      );
-      pdf.text(
-        `Fim: ${dayjs(showStats.end).format("DD/MM/YYYY HH:mm")}`,
-        14,
-        pdfHeight + 60
-      );
+      const statsY = y;
+      pdf.text(`Temperatura mínima: ${showStats.min.toFixed(2)} °C`, 10, statsY);
+      pdf.text(`Temperatura média: ${showStats.avg.toFixed(2)} °C`, 10, statsY + 8);
+      pdf.text(`Temperatura máxima: ${showStats.max.toFixed(2)} °C`, 10, statsY + 16);
+      pdf.text(`Início: ${dayjs(showStats.start).format("DD/MM/YYYY HH:mm")}`, 10, statsY + 24);
+      pdf.text(`Fim: ${dayjs(showStats.end).format("DD/MM/YYYY HH:mm")}`, 10, statsY + 32);
+      y += 42;
     }
 
-    pdf.save("grafico-temperatura.pdf");
+    // --- 2) Adiciona todas as tabelas ---
+    if (tablesEl) {
+      const tables = tablesEl.querySelectorAll(".table-wrap");
+
+      for (let i = 0; i < tables.length; i++) {
+        if (tables[i].style.display === "none") continue;
+
+        const canvas = await html2canvas(tables[i], { scale: 2 });
+        const imgData = canvas.toDataURL("image/png");
+        const imgHeight = (canvas.height * pdfWidth) / canvas.width;
+
+        if (y + imgHeight > pageHeight - 10) {
+          pdf.addPage();
+          y = 10;
+        }
+
+        pdf.addImage(imgData, "PNG", 10, y, pdfWidth - 20, imgHeight);
+        y += imgHeight + 10;
+      }
+    }
+
+    pdf.save("relatorio.pdf");
   };
 
+  // ---------- TELA DE LOGIN ----------
+  if (!isAuthenticated) {
+    return (
+      <div className="login-page">
+  <div className="login-card">
+    <img src="/logo.png" alt="Logo" className="login-logo" />
+    <h2>Bem-vindo</h2>
+    <p>Entre com suas credenciais para continuar</p>
+    <form className="login-form" onSubmit={handleLogin}>
+      <input
+        type="text"
+        placeholder="Usuário"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+      />
+      <input
+        type="password"
+        placeholder="Senha"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
+      {loginError && <div className="login-error">{loginError}</div>}
+      <button className="login-btn" type="submit">Entrar</button>
+    </form>
+  </div>
+</div>
+
+    );
+  }
+
+  // ---------- APP AUTENTICADO ----------
   return (
     <div className="app">
-
       {/* HEADER */}
       <header className="site-header">
         <div className="brand">
@@ -180,8 +290,10 @@ export default function App() {
           <a href="#inicio">Início</a>
           <a href="#como-funciona">Como funciona</a>
           <a href="#analise">Análise</a>
-          <a href="#faq">FAQ</a>
           <a href="#analise" className="btn nav-cta">Começar</a>
+          <button type="button" className="btn secondary" onClick={handleLogout} style={{ marginLeft: 12 }}>
+            Sair
+          </button>
         </nav>
       </header>
 
@@ -198,34 +310,7 @@ export default function App() {
             <a href="#analise" className="btn hero-btn">Enviar planilhas</a>
             <a href="#como-funciona" className="btn secondary hero-btn">Entender processo</a>
           </div>
-          <ul className="hero-badges">
-
-
-          </ul>
-        </div>
-      </section>
-
-      {/* FEATURES */}
-      <section className="panel features">
-        <div className="feature">
-          <div className="feature-icon">📈</div>
-          <h3>Gráficos Profissionais</h3>
-          <p>Visualize temperatura × tempo com múltiplas séries alinhadas por timestamp.</p>
-        </div>
-        <div className="feature">
-          <div className="feature-icon">🧠</div>
-          <h3>Estatísticas Automáticas</h3>
-          <p>Mínimo, máximo, média e intervalo temporal detectados a partir da sua planilha.</p>
-        </div>
-        <div className="feature">
-          <div className="feature-icon">🗂️</div>
-          <h3>Multi-planilha</h3>
-          <p>Compare até 5 arquivos ao mesmo tempo e oculte séries pelo legend.</p>
-        </div>
-        <div className="feature">
-          <div className="feature-icon">📄</div>
-          <h3>Exportação em PDF</h3>
-          <p>Capture o gráfico e as estatísticas para documentação técnica e auditorias.</p>
+          <ul className="hero-badges"></ul>
         </div>
       </section>
 
@@ -266,17 +351,17 @@ export default function App() {
           </label>
 
           <div className="btn-row">
-            <button className="btn" onClick={onUpload} disabled={files.length === 0 || loading}>
+            <button type="button" className="btn" onClick={onUpload} disabled={files.length === 0 || loading}>
               {loading ? "Processando..." : "Processar"}
             </button>
-            <button className="btn secondary" onClick={onReset}>Limpar</button>
+            <button type="button" className="btn secondary" onClick={onReset}>Limpar</button>
             {series.length > 0 && (
-              <button className="btn" onClick={exportPDF}>Exportar PDF</button>
+              <button type="button" className="btn" onClick={exportPDF}>Exportar PDF</button>
             )}
           </div>
         </div>
 
-        {error && <div className="err">{error}</div>}
+        {uploadError && <div className="err">{uploadError}</div>}
       </section>
 
       {/* FILTRO */}
@@ -351,26 +436,65 @@ export default function App() {
         </section>
       )}
 
-      {/* FAQ */}
-      <section id="faq" className="panel faq">
-        <h3>Dúvidas frequentes</h3>
-        <details>
-          <summary>Quais formatos são aceitos?</summary>
-          <p>.xls, .xlsx e .csv exportados pelo HT-810 datalogger.</p>
-        </details>
-        <details>
-          <summary>Posso comparar várias medições?</summary>
-          <p>Sim, envie até 5 planilhas e use o legend para ocultar/exibir séries.</p>
-        </details>
-        <details>
-          <summary>Como gero um relatório?</summary>
-          <p>Após analisar, clique em “Exportar PDF” para baixar o gráfico com estatísticas.</p>
-        </details>
-      </section>
+      {/* TABELAS */}
+      {series.length > 0 && (
+        <section className="panel" id="tables-section">
+          <div className="panel-title">Tabelas (amostragem a cada 1 hora)</div>
+
+          {series.map((s) => {
+            const hidden = hiddenKeys.includes(s.name);
+            const rows = resampledBySeries[s.name] || [];
+            return (
+              <div
+                key={s.name}
+                className="table-wrap"
+                style={{ display: hidden ? "none" : "block", marginTop: 12 }}
+              >
+                <div className="uploader-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{
+                    display: "inline-block", width: 10, height: 10, borderRadius: 999, background: s.color
+                  }} />
+                  <h4 style={{ margin: 0 }}>{s.name}</h4>
+                  <span className="badge">{rows.length} linha(s)</span>
+                </div>
+
+                <div className="table-scroll" style={{ overflowX: "auto", marginTop: 8 }}>
+                  <table className="data-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: "left", padding: "8px", borderBottom: "1px solid #e5e7eb" }}>Horário</th>
+                        <th style={{ textAlign: "left", padding: "8px", borderBottom: "1px solid #e5e7eb" }}>Temperatura (°C)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r, idx) => (
+                        <tr key={idx}>
+                          <td style={{ padding: "8px", borderBottom: "1px solid #f1f5f9" }}>
+                            {dayjs(r.timestamp).format("DD/MM/YYYY HH:mm")}
+                          </td>
+                          <td style={{ padding: "8px", borderBottom: "1px solid #f1f5f9" }}>
+                            {r.temperature.toFixed(2)}
+                          </td>
+                        </tr>
+                      ))}
+                      {rows.length === 0 && (
+                        <tr>
+                          <td colSpan={2} style={{ padding: "8px", color: "#64748b" }}>
+                            Sem dados para o período selecionado.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      )}
 
       {/* FOOTER */}
       <footer className="footer">
-        
         <div><b>Hospitech</b> — Engenharia Clínica</div>
         <div className="footer-note">© {new Date().getFullYear()} Hospitech. Todos os direitos reservados.</div>
       </footer>
